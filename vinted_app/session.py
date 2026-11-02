@@ -180,7 +180,7 @@ class VintedSession:
         if data is None:
             raise VintedError(
                 f"{path}: HTTP {resp.status}, ответ не JSON — вероятно, антибот-проверка сайта. "
-                "Откройте сайт с окном браузера (--headed) и пройдите проверку вручную."
+                "Запустите с окном браузера (--headed или SHOW_BROWSER = True) и пройдите проверку вручную."
             )
         return resp.status, data
 
@@ -198,7 +198,7 @@ class VintedSession:
             return self.current_user(_retry=False)
         if status in (401, 403):
             if "captcha-delivery" in json.dumps(data):
-                raise VintedError("Запрос заблокирован антиботом (DataDome). Повторите с --headed.")
+                raise VintedError("Запрос заблокирован антиботом (DataDome). Запустите с окном браузера (--headed или SHOW_BROWSER = True).")
             return None
         raise VintedError(f"Неожиданный ответ {CURRENT_USER_PATH}: HTTP {status}: {_error_text(data)}")
 
@@ -241,9 +241,9 @@ class VintedSession:
             self.refresh_tokens()
         except NotLoggedInError:
             raise NotLoggedInError(
-                "Vinted не принял токен: он истёк, сессию завершили (выход из аккаунта) или токен "
-                f"с другого сайта Vinted (в токене aud={payload.get('aud')}, а сайт "
-                f"{self.settings.base_url} — проверьте --base-url)."
+                "Vinted не принял токен: он истёк или отозван, либо он с другого сайта Vinted "
+                f"(в токене aud={payload.get('aud')}, а сайт {self.settings.base_url} — "
+                "проверьте адрес: --base-url или VINTED_URL в main.py)."
             ) from None
         return self.require_user()
 
@@ -281,7 +281,7 @@ class VintedSession:
             except PlaywrightError:
                 raise VintedError(
                     "Форма входа не появилась — вероятно, сайт показал проверку «вы человек?». "
-                    "Запустите с --headed и пройдите её в окне."
+                    "Запустите с окном браузера (--headed или SHOW_BROWSER = True) и пройдите её."
                 ) from None
             page.fill("input#username", email)
             page.fill("input#password", password)
@@ -324,7 +324,7 @@ class VintedSession:
             # 3. Капча DataDome.
             if page.locator(CAPTCHA_FRAME).count():
                 if self.headless:
-                    raise VintedError("Vinted показал капчу. Запустите с --headed и решите её в окне.")
+                    raise VintedError("Vinted показал капчу. Запустите с окном браузера (--headed или SHOW_BROWSER = True) и решите её.")
                 if not captcha_reported:
                     print("Vinted показал капчу — решите её в окне браузера.")
                     captcha_reported = True
