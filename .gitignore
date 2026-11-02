@@ -1,0 +1,8 @@
+# Профиль браузера с cookies сессии Vinted — НЕ коммитить, это доступ к аккаунту
+.vinted_profile/
+.env
+
+__pycache__/
+*.pyc
+.venv/
+venv/
