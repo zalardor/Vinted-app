@@ -24,7 +24,7 @@ from .service import (
     check_account,
     login_account,
     normalize_site,
-    send_from_account,
+    send_from_accounts,
 )
 from .session import VintedError, playwright_error_text
 
@@ -444,26 +444,20 @@ class App:
                 )
                 return bool(self._ask(lambda: messagebox.askyesno("Отправить сообщение?", question, parent=self.root)))
 
+            outcomes = send_from_accounts(self.store, names, url, text, confirm=confirm, log=log, headless=True)
             sent = 0
-            for name in names:
-                # Ошибка одного аккаунта не должна мешать остальным.
-                try:
-                    result = send_from_account(self.store, name, url, text, confirm=confirm, log=log, headless=True)
-                except VintedError as e:
-                    self.events.put(("log_error", f"«{name}»: {e}"))
-                    continue
-                except Exception as e:  # ошибки браузера и прочее
-                    self.events.put(("log_error", f"«{name}»: {playwright_error_text(e)}"))
-                    continue
-                if result is None:
-                    log(f"«{name}»: отправка отменена.")
-                    continue
-                sent += 1
-                seller = result.listing.seller_login or result.listing.seller_id
-                if result.verified:
-                    self.events.put(("ok", f"✓ Сообщение отправлено с аккаунта «{name}» продавцу {seller}."))
+            for o in outcomes:
+                if o.error is not None:
+                    self.events.put(("log_error", f"«{o.name}»: {o.error}"))
+                elif o.result is None:
+                    log(f"«{o.name}»: отправка отменена.")
                 else:
-                    log(f"«{name}»: сообщение отправлено, но подтвердить его в чате не удалось.")
+                    sent += 1
+                    seller = o.result.listing.seller_login or o.result.listing.seller_id
+                    if o.result.verified:
+                        self.events.put(("ok", f"✓ Сообщение отправлено с аккаунта «{o.name}» продавцу {seller}."))
+                    else:
+                        log(f"«{o.name}»: сообщение отправлено, но подтвердить его в чате не удалось.")
             if len(names) > 1:
                 log(f"Готово: отправлено с {sent} из {len(names)} аккаунтов.")
 
