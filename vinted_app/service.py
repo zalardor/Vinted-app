@@ -1,8 +1,8 @@
-"""Аккаунты Vinted: список аккаунтов, вход по токену, отправка сообщения с одного выбранного аккаунта.
+"""Аккаунты Vinted: список аккаунтов, вход по токену, отправка сообщения с выбранных аккаунтов.
 
 Общая логика для терминала (`python -m vinted_app accounts ...`) и окна (`python gui.py`).
 Каждый аккаунт хранит свою сессию в отдельной папке, поэтому входы не мешают друг другу.
-Сообщение всегда уходит ровно с одного аккаунта, выбранного для отправки.
+Сообщение можно отправить с нескольких выбранных аккаунтов: каждый пишет из своей сессии, по очереди.
 Refresh-токен вводится один раз — при добавлении или повторном входе. Дальше работает сохранённая
 сессия в папке аккаунта. Эта папка содержит cookie с токеном, поэтому её нельзя передавать.
 """
@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 
 from .config import Settings
 from .messaging import Listing, SendResult, get_listing, parse_listing_url, send_message_to_listing
-from .session import NotLoggedInError, VintedError, VintedSession, decode_jwt_payload
+from .session import NotLoggedInError, VintedError, VintedSession, decode_jwt_payload, playwright_error_text
 
 OK = "ok"
 NEED_TOKEN = "need_token"
@@ -203,28 +203,26 @@ def check_account(store: AccountStore, name: str, *, headless: bool = True) -> A
     return _save_login(store, account, user)
 
 
-def send_from_account(
+@dataclass
+class SendOutcome:
+    """Итог отправки с одного аккаунта: result — None, если отменено; error — текст ошибки, если не вышло."""
+
+    name: str
+    result: SendResult | None = None
+    error: str | None = None
+
+
+def _send_one(
     store: AccountStore,
-    name: str,
-    listing_url: str,
+    account: Account,
+    item_id: str,
     text: str,
     *,
     confirm: Callable[[Listing, Account], bool],
-    log: Callable[[str], None] = print,
-    headless: bool = True,
+    log: Callable[[str], None],
+    headless: bool,
 ) -> SendResult | None:
-    """Пишет продавцу объявления с одного выбранного аккаунта. Возвращает None, если отменено."""
-    account = _require(store, name)
-    text = (text or "").strip()
-    if not text:
-        raise VintedError("Сообщение пустое.")
-    base, item_id = parse_listing_url(listing_url)
-    if _site_key(base) != _site_key(account.base_url):
-        raise VintedError(
-            f"Аккаунт «{name}» зарегистрирован на {normalize_site(account.base_url)}, "
-            f"а объявление на {base}. Выберите аккаунт этой страны."
-        )
-
+    """Пишет продавцу из сессии одного аккаунта. Возвращает None, если пользователь отменил."""
     result: SendResult | None = None
     with VintedSession(_settings(store, account), headless=headless) as vs:
         try:
@@ -232,13 +230,13 @@ def send_from_account(
         except NotLoggedInError:
             _set_status(store, account, NEED_TOKEN)
             raise VintedError(
-                f"Вход в «{name}» истёк. Нажмите «Ввести токен» и вставьте токен этого аккаунта."
+                f"Вход в «{account.name}» истёк. Нажмите «Ввести токен» и вставьте токен этого аккаунта."
             ) from None
         if account.user_id and str(user.get("id")) != account.user_id:
             _set_status(store, account, NEED_TOKEN)
-            raise VintedError(f"В сохранённом входе «{name}» другой пользователь. Введите токен заново.")
+            raise VintedError(f"В сохранённом входе «{account.name}» другой пользователь. Введите токен заново.")
 
-        log(f"Аккаунт: «{name}» ({user.get('login', '?')}).")
+        log(f"Аккаунт: «{account.name}» ({user.get('login', '?')}).")
         listing = get_listing(vs, item_id)
         log(f"Объявление: {listing.title}")
         log(f"Продавец: {listing.seller_login or '?'} (id {listing.seller_id})")
@@ -249,3 +247,61 @@ def send_from_account(
 
     _save_login(store, account, user)
     return result
+
+
+def send_from_accounts(
+    store: AccountStore,
+    names: list[str],
+    listing_url: str,
+    text: str,
+    *,
+    confirm: Callable[[Listing, Account], bool],
+    log: Callable[[str], None] = print,
+    headless: bool = True,
+) -> list[SendOutcome]:
+    """Пишет продавцу объявления с каждого выбранного аккаунта по очереди, каждый из своей сессии.
+
+    Ошибка одного аккаунта не останавливает остальные: она попадает в его SendOutcome.
+    Ошибки, общие для всех (пустой текст, неверная ссылка, аккаунты не выбраны), выбрасываются сразу.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise VintedError("Сообщение пустое.")
+    if not names:
+        raise VintedError("Выберите хотя бы один аккаунт.")
+    base, item_id = parse_listing_url(listing_url)
+
+    outcomes: list[SendOutcome] = []
+    for name in dict.fromkeys(names):  # один аккаунт, выбранный дважды, пишет только один раз
+        outcome = SendOutcome(name=name)
+        try:
+            account = _require(store, name)
+            if _site_key(base) != _site_key(account.base_url):
+                raise VintedError(
+                    f"Аккаунт «{name}» зарегистрирован на {normalize_site(account.base_url)}, "
+                    f"а объявление на {base}. Выберите аккаунт этой страны."
+                )
+            outcome.result = _send_one(store, account, item_id, text, confirm=confirm, log=log, headless=headless)
+        except VintedError as e:
+            outcome.error = str(e)
+        except Exception as e:  # ошибки браузера и прочее: не должны остановить остальные аккаунты
+            outcome.error = playwright_error_text(e)
+        outcomes.append(outcome)
+    return outcomes
+
+
+def send_from_account(
+    store: AccountStore,
+    name: str,
+    listing_url: str,
+    text: str,
+    *,
+    confirm: Callable[[Listing, Account], bool],
+    log: Callable[[str], None] = print,
+    headless: bool = True,
+) -> SendResult | None:
+    """Отправка с одного аккаунта: ошибка сразу выбрасывается. Оставлено для терминальной команды `send`."""
+    outcome = send_from_accounts(store, [name], listing_url, text, confirm=confirm, log=log, headless=headless)[0]
+    if outcome.error is not None:
+        raise VintedError(outcome.error)
+    return outcome.result
