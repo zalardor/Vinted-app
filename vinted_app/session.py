@@ -147,7 +147,8 @@ class VintedSession:
         data = _json_or_none(resp)
         if resp.status == 200 and isinstance(data, dict):
             return data
-        if resp.status in (401, 404):
+        # 400 — токен уже использован или отозван, 401 — недействителен, 404 — токена нет.
+        if resp.status in (400, 401, 404):
             raise NotLoggedInError(f"Vinted не принял refresh-токен (HTTP {resp.status}).")
         raise VintedError(f"Не удалось обновить токены: HTTP {resp.status}: {_error_text(data)}")
 
