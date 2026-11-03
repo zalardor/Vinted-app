@@ -1,8 +1,47 @@
 # Vinted-app
 
-Авторизация в аккаунте Vinted из Python через настоящий браузер (Playwright).
+Авторизация в аккаунте Vinted из Python через настоящий браузер (Playwright)
+и отправка сообщения продавцу по ссылке на объявление.
 
-## Быстрый старт: main.py
+## Написать продавцу: окно приложения
+
+Самый простой способ. Запустите:
+
+```bash
+python gui.py
+```
+
+Откроется окно с тремя полями:
+
+- **Refresh-токен** — значение cookie `refresh_token_web` (как его взять — ниже).
+  Можно не вводить, если вход уже сохранён от прошлого раза.
+- **Ссылка на объявление** — например `https://www.vinted.pl/items/123-...`.
+  Сайт страны определяется по ссылке.
+- **Сообщение** — текст.
+
+Нажмите «Отправить». Приложение войдёт в аккаунт, покажет продавца и название
+объявления, спросит подтверждение и отправит сообщение. Ход работы виден в окне.
+
+> Для окна нужен Tkinter. В Windows и macOS он входит в установщик Python с python.org.
+> В Linux: `sudo apt install python3-tk`.
+
+## Написать продавцу: терминал
+
+```bash
+python -m vinted_app send "https://www.vinted.pl/items/123-nazwa" "Dzień dobry, czy dostępne?"
+```
+
+Токен берётся из сохранённого входа, иначе из `VINTED_REFRESH_TOKEN` или `--token`.
+Перед отправкой скрипт показывает продавца и спрашивает подтверждение (`-y` — без вопроса).
+Сайт страны берётся из ссылки (или из `--base-url` / `VINTED_BASE_URL`).
+
+```bash
+# вход заранее (чтобы потом не вводить токен)
+VINTED_REFRESH_TOKEN='eyJ...' python -m vinted_app --base-url https://www.vinted.pl login --token
+python -m vinted_app send "https://www.vinted.pl/items/123-nazwa" "okay" -y
+```
+
+## Вход в аккаунт: main.py
 
 1. Установите зависимости (см. «Установка» ниже).
 2. Откройте `main.py` и впишите свои данные в самом начале файла:
@@ -124,6 +163,19 @@ with VintedSession() as vs:                        # headless=False — пока
     vs.page.screenshot(path="vinted.png")                 # vs.page — обычная страница Playwright
 ```
 
+Написать продавцу по ссылке на объявление:
+
+```python
+from vinted_app import VintedSession, get_listing, parse_listing_url, send_message_to_listing
+
+base_url, item_id = parse_listing_url("https://www.vinted.pl/items/123-nazwa")
+with VintedSession() as vs:
+    vs.ensure_login(refresh_token)             # сохранённая сессия или вход по токену
+    listing = get_listing(vs, item_id)         # продавец и название объявления
+    result = send_message_to_listing(vs, listing, "okay")
+    print("Отправлено:", result.verified)      # True — сообщение найдено в чате после отправки
+```
+
 ## Настройки (переменные окружения)
 
 | Переменная             | По умолчанию            | Что это                                    |
@@ -132,6 +184,7 @@ with VintedSession() as vs:                        # headless=False — пока
 | `VINTED_PROFILE_DIR`   | `.vinted_profile`       | папка профиля браузера с сессией           |
 | `VINTED_PASSWORD`      | —                       | пароль для `login --email` (иначе спросит) |
 | `VINTED_REFRESH_TOKEN` | —                       | токен для `login --token` (иначе спросит)  |
+| `VINTED_API_URL`       | `api.<домен>`           | адрес API сообщений (обычно менять не нужно) |
 | `VINTED_CHROMIUM_PATH` | —                       | свой Chromium вместо скачанного Playwright |
 
 ## Если что-то не так

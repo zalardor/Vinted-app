@@ -9,6 +9,7 @@ import sys
 from playwright.sync_api import Error as PlaywrightError
 
 from .config import Settings
+from .messaging import get_listing, parse_listing_url, send_message_to_listing
 from .session import VintedError, VintedSession
 
 
@@ -72,6 +73,37 @@ def cmd_whoami(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
+    base_url, item_id = parse_listing_url(args.url)
+    if not args.base_url and not os.environ.get("VINTED_BASE_URL"):
+        settings = dataclasses.replace(settings, base_url=base_url)  # сайт берём из ссылки
+    token = os.environ.get("VINTED_REFRESH_TOKEN") or args.token
+
+    with VintedSession(settings, headless=not args.headed) as vs:
+        user = vs.ensure_login(token)
+        print(f"Вы вошли как {_describe(user)}.")
+        listing = get_listing(vs, item_id)
+        print(f"Объявление: {listing.title}")
+        print(f"Продавец:   {listing.seller_login or '?'} (id {listing.seller_id})")
+        if not args.yes:
+            answer = input(f'Отправить «{args.message}» этому продавцу? [y/N] ').strip().lower()
+            if answer not in ("y", "yes", "д", "да"):
+                print("Отменено — ничего не отправлено.")
+                return 1
+        result = send_message_to_listing(vs, listing, args.message)
+        if result.verified:
+            print(f"✓ Сообщение отправлено продавцу {listing.seller_login or listing.seller_id}.")
+        else:
+            print("Сообщение отправлено, но подтвердить его в чате не удалось.")
+    return 0
+
+
+def cmd_gui(settings: Settings, args: argparse.Namespace) -> int:
+    from .gui import main as gui_main
+
+    return gui_main()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m vinted_app", description="Авторизация в Vinted")
     parser.add_argument(
@@ -105,6 +137,17 @@ def main(argv: list[str] | None = None) -> int:
     p_who = sub.add_parser("whoami", help="проверить, сохранён ли вход")
     p_who.add_argument("--headed", action="store_true", help="показать окно браузера")
     p_who.set_defaults(func=cmd_whoami)
+
+    p_send = sub.add_parser("send", help="написать продавцу объявления")
+    p_send.add_argument("url", help="ссылка на объявление, например https://www.vinted.pl/items/123-...")
+    p_send.add_argument("message", help="текст сообщения")
+    p_send.add_argument("--token", help="refresh-токен (иначе VINTED_REFRESH_TOKEN или сохранённый вход)")
+    p_send.add_argument("--headed", action="store_true", help="показать окно браузера")
+    p_send.add_argument("-y", "--yes", action="store_true", help="не спрашивать подтверждение")
+    p_send.set_defaults(func=cmd_send)
+
+    p_gui = sub.add_parser("gui", help="открыть окно приложения")
+    p_gui.set_defaults(func=cmd_gui)
 
     args = parser.parse_args(argv)
     settings = Settings.from_env()

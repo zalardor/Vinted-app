@@ -62,6 +62,15 @@ def _json_or_none(resp: APIResponse | Response) -> Any:
         return None
 
 
+def playwright_error_text(exc: Exception) -> str:
+    """Короткое описание ошибки браузера (Playwright) или любой другой для показа пользователю."""
+    message = getattr(exc, "message", None) or str(exc)
+    first_line = message.splitlines()[0] if message else exc.__class__.__name__
+    if isinstance(exc, PlaywrightError):
+        return f"Ошибка браузера: {first_line}"
+    return first_line
+
+
 def _error_text(data: Any) -> str:
     if isinstance(data, dict):
         for key in ("message", "error_description", "error", "errors"):
@@ -214,11 +223,32 @@ class VintedSession:
 
     # --- вход: refresh-токен --------------------------------------------------
 
-    def login_with_token(self, refresh_token: str) -> dict:
-        """Вход по значению cookie refresh_token_web, скопированному из браузера, где вы уже вошли."""
+    @staticmethod
+    def _clean_token(refresh_token: str) -> str:
         token = refresh_token.strip().strip("\"'")
         if token.startswith(REFRESH_COOKIE + "="):
             token = token[len(REFRESH_COOKIE) + 1 :]
+        return token
+
+    def ensure_login(self, refresh_token: str | None = None) -> dict:
+        """Сохранённая сессия, а если её нет (или токен от другого аккаунта) — вход по токену.
+
+        Скопированный токен Vinted принимает только один раз, поэтому, если этот же аккаунт уже
+        вошёл, токен не используется повторно.
+        """
+        token = self._clean_token(refresh_token or "")
+        user = self.current_user()
+        if user is not None:
+            payload = decode_jwt_payload(token) if token else None
+            if payload is None or str(payload.get("sub")) == str(user.get("id")):
+                return user
+        if not token:
+            raise NotLoggedInError("Вход не выполнен: нужен refresh-токен (cookie refresh_token_web).")
+        return self.login_with_token(token)
+
+    def login_with_token(self, refresh_token: str) -> dict:
+        """Вход по значению cookie refresh_token_web, скопированному из браузера, где вы уже вошли."""
+        token = self._clean_token(refresh_token)
         payload = decode_jwt_payload(token)
         if payload is None:
             raise VintedError("Это не похоже на токен Vinted (ожидается строка вида eyJ...xxx.yyy).")
@@ -231,6 +261,8 @@ class VintedSession:
             )
 
         ctx = self._ctx()
+        # Запоминаем текущую сессию, чтобы вернуть её, если новый токен не подойдёт.
+        backup = [c for c in ctx.cookies() if c["name"] in (ACCESS_COOKIE, REFRESH_COOKIE)]
         ctx.clear_cookies(name=ACCESS_COOKIE)
         ctx.clear_cookies(name=REFRESH_COOKIE)
         host = urlparse(self.settings.base_url).hostname
@@ -241,10 +273,13 @@ class VintedSession:
         try:
             self.refresh_tokens()
         except NotLoggedInError:
+            ctx.clear_cookies(name=REFRESH_COOKIE)
+            if backup:
+                ctx.add_cookies(backup)
             raise NotLoggedInError(
-                "Vinted не принял токен: он истёк или отозван, либо он с другого сайта Vinted "
-                f"(страна в токене: {payload.get('cc', '?')}, а сайт {self.settings.base_url} — "
-                "проверьте адрес: --base-url или VINTED_URL в main.py)."
+                "Vinted не принял токен: он истёк, отозван или уже был использован (скопированный "
+                "токен принимается один раз — скопируйте свежий), либо он с сайта другой страны "
+                f"(страна в токене: {payload.get('cc', '?')}, сайт: {self.settings.base_url})."
             ) from None
         return self.require_user()
 
