@@ -242,7 +242,7 @@ class VintedSession:
         except NotLoggedInError:
             raise NotLoggedInError(
                 "Vinted не принял токен: он истёк или отозван, либо он с другого сайта Vinted "
-                f"(в токене aud={payload.get('aud')}, а сайт {self.settings.base_url} — "
+                f"(страна в токене: {payload.get('cc', '?')}, а сайт {self.settings.base_url} — "
                 "проверьте адрес: --base-url или VINTED_URL в main.py)."
             ) from None
         return self.require_user()

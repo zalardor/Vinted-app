@@ -88,7 +88,7 @@ python -m vinted_app --base-url https://www.vinted.pl login --token
 VINTED_REFRESH_TOKEN='eyJ...' python -m vinted_app --base-url https://www.vinted.pl login --token
 ```
 
-Токен должен быть с того же сайта (`--base-url`), где вы входили. Токен анонимного
+Токен должен быть с того же сайта (`--base-url`), где вы входили. Токен действует около 7 дней с момента выдачи: когда он закончится, скопируйте новый или войдите по почте. Токен анонимного
 посетителя (до входа) и `access_token_web` не подойдут: скрипт об этом скажет.
 
 ### Вручную в окне
