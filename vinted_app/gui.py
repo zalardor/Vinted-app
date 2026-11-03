@@ -1,4 +1,4 @@
-"""Окно приложения: несколько аккаунтов и отправка сообщения продавцу с одного выбранного аккаунта.
+"""Окно приложения: несколько аккаунтов и отправка сообщения продавцу с одного или нескольких выбранных аккаунтов.
 
 Запуск: python gui.py   или   python -m vinted_app gui
 """
@@ -82,7 +82,7 @@ class App:
         self.store = store or service.default_store()
         self.events: queue.Queue = queue.Queue()
         self.busy = False
-        self.account_var = tk.StringVar(value="")
+        self.picked: dict[str, tk.BooleanVar] = {}  # имя аккаунта -> отмечен ли он для отправки
 
         root.title(TITLE)
         root.minsize(740, 700)
@@ -120,8 +120,8 @@ class App:
         ):
             ttk.Button(buttons, text=text, command=command).pack(side="left", padx=(0, 6))
 
-        # --- выбор аккаунта для отправки: только один
-        pick_box = ttk.LabelFrame(frame, text="Отправить с аккаунта (выберите один)", padding=10)
+        # --- выбор аккаунтов для отправки: можно отметить несколько
+        pick_box = ttk.LabelFrame(frame, text="Отправить с аккаунтов (отметьте один или несколько)", padding=10)
         pick_box.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         self.picker = ttk.Frame(pick_box)
         self.picker.pack(anchor="w")
@@ -167,22 +167,34 @@ class App:
         for widget in self.picker.winfo_children():
             widget.destroy()
         if not accounts:
-            self.account_var.set("")
+            self.picked.clear()
             ttk.Label(self.picker, text="Аккаунтов пока нет. Нажмите «Добавить аккаунт».", foreground="gray").pack(
                 anchor="w"
             )
             return
-        if self.account_var.get() not in {a.name for a in accounts}:
-            self.account_var.set(accounts[0].name)
+
+        # Первый запуск (список выбора пуст) — сразу отмечаем первый аккаунт, как раньше.
+        first_time = not self.picked
+        names = {a.name for a in accounts}
+        for name in list(self.picked):
+            if name not in names:
+                del self.picked[name]
+        for a in accounts:
+            if a.name not in self.picked:
+                self.picked[a.name] = tk.BooleanVar(value=first_time and a.name == accounts[0].name)
         for a in accounts:
             hint = "" if a.status == OK else f"  — {STATUS_TEXT[a.status]}"
-            ttk.Radiobutton(
-                self.picker, text=f"{a.name}  ({a.login or '—'}){hint}", value=a.name, variable=self.account_var
+            ttk.Checkbutton(
+                self.picker, text=f"{a.name}  ({a.login or '—'}){hint}", variable=self.picked[a.name]
             ).pack(anchor="w", pady=1)
 
     def _selected_name(self) -> str | None:
         selected = self.tree.selection()
         return selected[0][len("acc:"):] if selected else None
+
+    def _picked_names(self) -> list[str]:
+        """Имена отмеченных для отправки аккаунтов."""
+        return [name for name, var in self.picked.items() if var.get()]
 
     # --- связь с фоновыми потоками ------------------------------------------------
 
@@ -234,6 +246,8 @@ class App:
                     self._write(payload)
                 elif kind == "ok":
                     self._write(payload, "ok")
+                elif kind == "log_error":
+                    self._write(payload, "error")
                 elif kind == "error":
                     self._write(f"Ошибка: {payload}", "error")
                     messagebox.showerror(TITLE, payload, parent=self.root)
@@ -404,11 +418,11 @@ class App:
     # --- отправка -----------------------------------------------------------------
 
     def on_send(self) -> None:
-        name = self.account_var.get()
+        names = self._picked_names()
         url = self.url.get().strip()
         text = self.message.get("1.0", "end").strip()
-        if not name:
-            messagebox.showwarning(TITLE, "Добавьте аккаунт и выберите его для отправки.", parent=self.root)
+        if not names:
+            messagebox.showwarning(TITLE, "Добавьте аккаунт и отметьте, с каких аккаунтов отправить.", parent=self.root)
             return
         if not url:
             messagebox.showwarning(TITLE, "Вставьте ссылку на объявление.", parent=self.root)
@@ -430,14 +444,28 @@ class App:
                 )
                 return bool(self._ask(lambda: messagebox.askyesno("Отправить сообщение?", question, parent=self.root)))
 
-            result = send_from_account(self.store, name, url, text, confirm=confirm, log=log, headless=True)
-            if result is None:
-                return
-            seller = result.listing.seller_login or result.listing.seller_id
-            if result.verified:
-                self.events.put(("ok", f"✓ Сообщение отправлено с аккаунта «{name}» продавцу {seller}."))
-            else:
-                self.events.put(("log", "Сообщение отправлено, но подтвердить его в чате не удалось."))
+            sent = 0
+            for name in names:
+                # Ошибка одного аккаунта не должна мешать остальным.
+                try:
+                    result = send_from_account(self.store, name, url, text, confirm=confirm, log=log, headless=True)
+                except VintedError as e:
+                    self.events.put(("log_error", f"«{name}»: {e}"))
+                    continue
+                except Exception as e:  # ошибки браузера и прочее
+                    self.events.put(("log_error", f"«{name}»: {playwright_error_text(e)}"))
+                    continue
+                if result is None:
+                    log(f"«{name}»: отправка отменена.")
+                    continue
+                sent += 1
+                seller = result.listing.seller_login or result.listing.seller_id
+                if result.verified:
+                    self.events.put(("ok", f"✓ Сообщение отправлено с аккаунта «{name}» продавцу {seller}."))
+                else:
+                    log(f"«{name}»: сообщение отправлено, но подтвердить его в чате не удалось.")
+            if len(names) > 1:
+                log(f"Готово: отправлено с {sent} из {len(names)} аккаунтов.")
 
         self._run_bg(work)
 
