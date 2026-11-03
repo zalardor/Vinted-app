@@ -1,4 +1,4 @@
-"""Окно приложения: несколько аккаунтов и отправка сообщения продавцу с выбранных аккаунтов.
+"""Окно приложения: несколько аккаунтов и ОДНОВРЕМЕННАЯ отправка сообщений продавцу.
 
 Запуск: python gui.py   или   python -m vinted_app gui
 """
@@ -82,8 +82,11 @@ class App:
         self.store = store or service.default_store()
         self.events: queue.Queue = queue.Queue()
         self.busy = False
-        # Словарь для хранения BooleanVar под каждый аккаунт (вместо одной account_var)
+        
+        # Словарь для хранения состояний флажков множественного выбора аккаунтов
         self.account_vars: dict[str, tk.BooleanVar] = {}
+        # Счетчик активных параллельных потоков отправки
+        self.active_sending_threads = 0
 
         root.title(TITLE)
         root.minsize(740, 700)
@@ -121,8 +124,8 @@ class App:
         ):
             ttk.Button(buttons, text=text, command=command).pack(side="left", padx=(0, 6))
 
-        # --- выбор аккаунтов для отправки: множественный выбор
-        pick_box = ttk.LabelFrame(frame, text="Отправить с аккаунтов (выберите один или несколько)", padding=10)
+        # --- выбор аккаунтов для отправки (Флажки вместо переключателей)
+        pick_box = ttk.LabelFrame(frame, text="Отправить с аккаунтов (выберите несколько)", padding=10)
         pick_box.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         self.picker = ttk.Frame(pick_box)
         self.picker.pack(anchor="w")
@@ -137,7 +140,7 @@ class App:
         ttk.Label(message_box, text="Сообщение").grid(row=2, column=0, sticky="w")
         self.message = tk.Text(message_box, height=5, wrap="word", undo=True, relief="solid", borderwidth=1)
         self.message.grid(row=3, column=0, sticky="ew")
-        self.send_button = ttk.Button(message_box, text="Отправить", command=self.on_send)
+        self.send_button = ttk.Button(message_box, text="Отправить одновременно", command=self.on_send)
         self.send_button.grid(row=4, column=0, sticky="e", pady=(8, 0))
 
         # --- журнал
@@ -154,7 +157,7 @@ class App:
         self.refresh_accounts()
         root.after(100, self._poll)
 
-    # --- список аккаунтов и выбор -------------------------------------------------
+    # --- список аккаунтов и множественный выбор ----------------------------------
 
     def refresh_accounts(self) -> None:
         accounts = self.store.accounts()
@@ -165,10 +168,8 @@ class App:
             site = normalize_site(a.base_url).replace("https://", "").replace("http://", "")
             self.tree.insert("", "end", iid=f"acc:{a.name}", values=(a.name, a.login or "—", site, STATUS_TEXT[a.status]))
 
-        # Очищаем старые виджеты флажков
         for widget in self.picker.winfo_children():
             widget.destroy()
-
         if not accounts:
             self.account_vars.clear()
             ttk.Label(self.picker, text="Аккаунтов пока нет. Нажмите «Добавить аккаунт».", foreground="gray").pack(
@@ -176,24 +177,19 @@ class App:
             )
             return
 
-        # Сохраняем состояния галочек только для существующих аккаунтов
         old_vars = self.account_vars.copy()
         self.account_vars.clear()
-
+        
         for a in accounts:
-            # Если аккаунт уже был, сохраняем его состояние галочки, иначе по умолчанию False
             if a.name in old_vars:
                 self.account_vars[a.name] = old_vars[a.name]
             else:
                 self.account_vars[a.name] = tk.BooleanVar(value=False)
-
+                
             hint = "" if a.status == OK else f"  — {STATUS_TEXT[a.status]}"
-            
-            # Меняем Radiobutton на Checkbutton для множественного выбора
+            # Используем Checkbutton вместо Radiobutton для мульти-выбора
             ttk.Checkbutton(
-                self.picker, 
-                text=f"{a.name}  ({a.login or '—'}){hint}", 
-                variable=self.account_vars[a.name]
+                self.picker, text=f"{a.name}  ({a.login or '—'}){hint}", variable=self.account_vars[a.name]
             ).pack(anchor="w", pady=1)
 
     def _selected_name(self) -> str | None:
@@ -222,8 +218,8 @@ class App:
         return box.get("value")
 
     def _run_bg(self, fn, *args) -> bool:
-        """Запускает долгую операцию в фоне. Одновременно идёт только одна."""
-        if self.busy:
+        """Запускает системную операцию (добавление/проверка). Не используется для рассылки."""
+        if self.busy or self.active_sending_threads > 0:
             messagebox.showinfo(TITLE, "Дождитесь окончания текущей операции.", parent=self.root)
             return False
         self._set_busy(True)
@@ -233,7 +229,7 @@ class App:
                 fn(*args)
             except VintedError as e:
                 self.events.put(("error", str(e)))
-            except Exception as e:  # ошибки браузера и прочее
+            except Exception as e:
                 self.events.put(("error", playwright_error_text(e)))
             finally:
                 self._post(self.refresh_accounts)
@@ -256,17 +252,16 @@ class App:
                 elif kind == "call":
                     try:
                         payload()
-                    except Exception as e:  # одна ошибка не должна останавливать окно
+                    except Exception as e:
                         self._write(f"Ошибка окна: {e}", "error")
                 elif kind == "idle":
                     self._set_busy(False)
+                elif kind == "thread_done":
+                    self.active_sending_threads -= 1
+                    if self.active_sending_threads <= 0:
+                        self.active_sending_threads = 0
+                        self._set_busy(False)
+                        self._write("=== Все одновременные отправки завершены ===")
+                        self.refresh_accounts()
         except queue.Empty:
             pass
-        self.root.after(100, self._poll)
-
-    def _set_busy(self, busy: bool) -> None:
-        self.busy = busy
-        self.send_button.configure(state="disabled" if busy else "normal")
-
-    def _write(self, text: str, tag: str | None = None) -> None:
-        self.log.configure(state="normal")
