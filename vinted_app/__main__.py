@@ -8,8 +8,10 @@ import sys
 
 from playwright.sync_api import Error as PlaywrightError
 
+from . import service
 from .config import Settings
 from .messaging import get_listing, parse_listing_url, send_message_to_listing
+from .service import OK, STATUS_TEXT, add_account, check_account, login_account, send_from_account
 from .session import VintedError, VintedSession
 
 
@@ -74,6 +76,30 @@ def cmd_whoami(settings: Settings, args: argparse.Namespace) -> int:
 
 
 def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
+    if args.account:
+        # С выбранного аккаунта: его сохранённый вход и его сайт.
+        def confirm(listing, account) -> bool:
+            if args.yes:
+                return True
+            answer = input(
+                f'С аккаунта «{account.name}» отправить «{args.message}» продавцу '
+                f'{listing.seller_login or "?"}? [y/N] '
+            )
+            return answer.strip().lower() in ("y", "yes", "д", "да")
+
+        result = send_from_account(
+            service.default_store(), args.account, args.url, args.message,
+            confirm=confirm, log=print, headless=not args.headed,
+        )
+        if result is None:
+            return 1
+        if result.verified:
+            print(f"✓ Сообщение отправлено продавцу {result.listing.seller_login or result.listing.seller_id}.")
+        else:
+            print("Сообщение отправлено, но подтвердить его в чате не удалось.")
+        return 0
+
+    # Без --account: один общий вход (папка .vinted_profile), как раньше.
     base_url, item_id = parse_listing_url(args.url)
     if not args.base_url and not os.environ.get("VINTED_BASE_URL"):
         settings = dataclasses.replace(settings, base_url=base_url)  # сайт берём из ссылки
@@ -96,6 +122,47 @@ def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
         else:
             print("Сообщение отправлено, но подтвердить его в чате не удалось.")
     return 0
+
+
+def cmd_accounts(settings: Settings, args: argparse.Namespace) -> int:
+    store = service.default_store()
+
+    if args.acc_cmd == "list":
+        accounts = store.accounts()
+        if not accounts:
+            print("Аккаунтов пока нет. Добавьте, например:")
+            print("  python -m vinted_app accounts add Я --site https://www.vinted.pl --consent")
+            return 0
+        for a in accounts:
+            print(f"{a.name:<16} {(a.login or '—'):<22} {a.base_url:<28} {STATUS_TEXT[a.status]}")
+        return 0
+
+    if args.acc_cmd == "add":
+        if not args.consent:
+            raise VintedError("Добавьте --consent: подтвердите, что аккаунт ваш или владелец дал согласие.")
+        if not args.site:
+            raise VintedError("Укажите сайт аккаунта: --site https://www.vinted.pl")
+        token = _secret("VINTED_REFRESH_TOKEN", f"Refresh-токен для «{args.name}» (ввод скрыт): ")
+        account = add_account(store, args.name, args.site, token, consent=True, headless=not args.headed)
+        print(f"Аккаунт «{account.name}» добавлен: {account.login} (id {account.user_id}).")
+        return 0
+
+    if args.acc_cmd == "login":
+        account = check_account(store, args.name, headless=not args.headed)
+        if account.status == OK:
+            print(f"«{account.name}»: вход сохранён ({account.login}). Токен не нужен.")
+            return 0
+        token = _secret("VINTED_REFRESH_TOKEN", f"Новый refresh-токен для «{args.name}» (ввод скрыт): ")
+        account = login_account(store, args.name, token, headless=not args.headed)
+        print(f"«{account.name}»: вход выполнен ({account.login}).")
+        return 0
+
+    if args.acc_cmd == "remove":
+        store.remove(args.name)
+        print(f"Аккаунт «{args.name}» удалён вместе с сохранённым входом.")
+        return 0
+
+    return 2
 
 
 def cmd_gui(settings: Settings, args: argparse.Namespace) -> int:
@@ -141,10 +208,26 @@ def main(argv: list[str] | None = None) -> int:
     p_send = sub.add_parser("send", help="написать продавцу объявления")
     p_send.add_argument("url", help="ссылка на объявление, например https://www.vinted.pl/items/123-...")
     p_send.add_argument("message", help="текст сообщения")
-    p_send.add_argument("--token", help="refresh-токен (иначе VINTED_REFRESH_TOKEN или сохранённый вход)")
+    p_send.add_argument("--account", metavar="NAME", help="с какого аккаунта отправить (см. accounts list)")
+    p_send.add_argument("--token", help="refresh-токен без --account (иначе VINTED_REFRESH_TOKEN или сохранённый вход)")
     p_send.add_argument("--headed", action="store_true", help="показать окно браузера")
     p_send.add_argument("-y", "--yes", action="store_true", help="не спрашивать подтверждение")
     p_send.set_defaults(func=cmd_send)
+
+    p_acc = sub.add_parser("accounts", help="несколько аккаунтов: список, добавление, вход, удаление")
+    acc_sub = p_acc.add_subparsers(dest="acc_cmd", required=True)
+    acc_sub.add_parser("list", help="показать аккаунты и их статус")
+    p_add = acc_sub.add_parser("add", help="добавить аккаунт по refresh-токену")
+    p_add.add_argument("name", help="имя аккаунта в приложении, например «Аня»")
+    p_add.add_argument("--site", help="сайт аккаунта, например https://www.vinted.pl")
+    p_add.add_argument("--consent", action="store_true", help="подтверждаю: аккаунт мой или владелец дал согласие")
+    p_add.add_argument("--headed", action="store_true", help="показать окно браузера")
+    p_login_acc = acc_sub.add_parser("login", help="войти заново, если сессия истекла (спросит токен)")
+    p_login_acc.add_argument("name", help="имя аккаунта")
+    p_login_acc.add_argument("--headed", action="store_true", help="показать окно браузера")
+    p_rm = acc_sub.add_parser("remove", help="удалить аккаунт и его сохранённый вход")
+    p_rm.add_argument("name", help="имя аккаунта")
+    p_acc.set_defaults(func=cmd_accounts)
 
     p_gui = sub.add_parser("gui", help="открыть окно приложения")
     p_gui.set_defaults(func=cmd_gui)

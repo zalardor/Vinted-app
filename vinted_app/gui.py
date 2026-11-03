@@ -1,12 +1,10 @@
-"""Окно приложения: refresh-токен, ссылка на объявление, сообщение -> отправка продавцу.
+"""Окно приложения: несколько аккаунтов и отправка сообщения продавцу с одного выбранного аккаунта.
 
 Запуск: python gui.py   или   python -m vinted_app gui
 """
 
 from __future__ import annotations
 
-import dataclasses
-import os
 import queue
 import sys
 import threading
@@ -17,13 +15,25 @@ try:
 except ImportError:  # на Linux Tkinter ставится отдельно
     tk = None
 
-from .config import Settings
-from .messaging import Listing, get_listing, parse_listing_url, send_message_to_listing
-from .session import VintedError, VintedSession, playwright_error_text
+from . import service
+from .service import (
+    OK,
+    STATUS_TEXT,
+    AccountStore,
+    add_account,
+    check_account,
+    login_account,
+    normalize_site,
+    send_from_account,
+)
+from .session import VintedError, playwright_error_text
 
-TITLE = "Vinted — сообщение продавцу"
+TITLE = "Vinted — сообщения продавцам"
+RED = "#c62828"
+GREEN = "#2e7d32"
+DEFAULT_SITE = "https://www.vinted.pl"
 
-# Ctrl+C/V/X/A при русской раскладке: Tk не узнаёт эти сочетания, поэтому смотрим на код клавиши
+# Ctrl+C/V/X/A при не-латинской раскладке: Tk не узнаёт эти сочетания, поэтому смотрим на код клавиши
 # (Windows и X11 соответственно).
 _CTRL_KEYCODES = {
     "<<Paste>>": (86, 55),
@@ -33,73 +43,214 @@ _CTRL_KEYCODES = {
 }
 
 
+def _on_ctrl_key(event):
+    if event.keysym.lower() in ("v", "c", "x", "a"):
+        return None  # латинская раскладка — Tk справится сам
+    for virtual, codes in _CTRL_KEYCODES.items():
+        if event.keycode in codes:
+            event.widget.event_generate(virtual)
+            return "break"
+    return None
+
+
+def add_clipboard_menu(widget) -> None:
+    """Меню «Вырезать / Копировать / Вставить» по правой кнопке мыши."""
+    menu = tk.Menu(widget, tearoff=False)
+    for label, event in (
+        ("Вырезать", "<<Cut>>"),
+        ("Копировать", "<<Copy>>"),
+        ("Вставить", "<<Paste>>"),
+        ("Выделить всё", "<<SelectAll>>"),
+    ):
+        menu.add_command(label=label, command=lambda e=event: widget.event_generate(e))
+    widget.bind("<Button-3>", lambda ev: menu.tk_popup(ev.x_root, ev.y_root))
+
+
+def _grab_later(dlg) -> None:
+    def grab() -> None:
+        try:
+            dlg.grab_set()
+        except tk.TclError:  # окно ещё не показано — пропускаем
+            pass
+
+    dlg.after(100, grab)
+
+
 class App:
-    def __init__(self, root: "tk.Tk") -> None:
+    def __init__(self, root, store: AccountStore | None = None) -> None:
         self.root = root
+        self.store = store or service.default_store()
         self.events: queue.Queue = queue.Queue()
         self.busy = False
+        self.account_var = tk.StringVar(value="")
 
         root.title(TITLE)
-        root.minsize(560, 520)
+        root.minsize(740, 700)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
 
         frame = ttk.Frame(root, padding=16)
         frame.grid(sticky="nsew")
         frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(4, weight=1)
 
-        ttk.Label(frame, text="Refresh-токен (cookie refresh_token_web)").grid(row=0, column=0, sticky="w")
-        self.token = ttk.Entry(frame, show="•")
-        self.token.grid(row=1, column=0, sticky="ew")
-        self.token_hint = ttk.Label(frame, text="Можно не вводить, если вход уже сохранён.", foreground="gray")
-        self.token_hint.grid(row=2, column=0, sticky="w", pady=(2, 12))
+        # --- аккаунты
+        accounts_box = ttk.LabelFrame(frame, text="Аккаунты", padding=10)
+        accounts_box.grid(row=0, column=0, sticky="ew")
+        accounts_box.columnconfigure(0, weight=1)
+        self.tree = ttk.Treeview(
+            accounts_box, columns=("name", "login", "site", "status"), show="headings", height=5, selectmode="browse"
+        )
+        for col, title, width in (
+            ("name", "Имя", 150),
+            ("login", "Логин", 160),
+            ("site", "Сайт", 180),
+            ("status", "Статус", 150),
+        ):
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=width, stretch=True)
+        self.tree.grid(row=0, column=0, sticky="ew")
+        buttons = ttk.Frame(accounts_box)
+        buttons.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        for text, command in (
+            ("Добавить аккаунт", self.on_add),
+            ("Ввести токен", self.on_login),
+            ("Проверить все", self.on_check),
+            ("Удалить", self.on_remove),
+        ):
+            ttk.Button(buttons, text=text, command=command).pack(side="left", padx=(0, 6))
 
-        ttk.Label(frame, text="Ссылка на объявление").grid(row=3, column=0, sticky="w")
-        self.url = ttk.Entry(frame)
-        self.url.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+        # --- выбор аккаунта для отправки: только один
+        pick_box = ttk.LabelFrame(frame, text="Отправить с аккаунта (выберите один)", padding=10)
+        pick_box.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        self.picker = ttk.Frame(pick_box)
+        self.picker.pack(anchor="w")
 
-        ttk.Label(frame, text="Сообщение").grid(row=5, column=0, sticky="w")
-        self.message = tk.Text(frame, height=6, wrap="word", undo=True, relief="solid", borderwidth=1)
-        self.message.grid(row=6, column=0, sticky="nsew", pady=(0, 12))
-        frame.rowconfigure(6, weight=1)
+        # --- сообщение
+        message_box = ttk.Frame(frame)
+        message_box.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        message_box.columnconfigure(0, weight=1)
+        ttk.Label(message_box, text="Ссылка на объявление").grid(row=0, column=0, sticky="w")
+        self.url = ttk.Entry(message_box)
+        self.url.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(message_box, text="Сообщение").grid(row=2, column=0, sticky="w")
+        self.message = tk.Text(message_box, height=5, wrap="word", undo=True, relief="solid", borderwidth=1)
+        self.message.grid(row=3, column=0, sticky="ew")
+        self.send_button = ttk.Button(message_box, text="Отправить", command=self.on_send)
+        self.send_button.grid(row=4, column=0, sticky="e", pady=(8, 0))
 
-        self.send_button = ttk.Button(frame, text="Отправить", command=self.on_send)
-        self.send_button.grid(row=7, column=0, sticky="e")
+        # --- журнал
+        ttk.Label(frame, text="Ход работы").grid(row=3, column=0, sticky="w", pady=(12, 0))
+        self.log = tk.Text(frame, height=8, wrap="word", state="disabled", relief="solid", borderwidth=1)
+        self.log.grid(row=4, column=0, sticky="nsew")
+        self.log.tag_configure("error", foreground=RED)
+        self.log.tag_configure("ok", foreground=GREEN)
 
-        ttk.Label(frame, text="Ход работы").grid(row=8, column=0, sticky="w", pady=(12, 0))
-        self.log = tk.Text(frame, height=8, wrap="word", state="disabled", relief="solid", borderwidth=1,
-                           background=root.cget("background"))
-        self.log.grid(row=9, column=0, sticky="nsew")
-        self.log.tag_configure("error", foreground="#c62828")
-        self.log.tag_configure("ok", foreground="#2e7d32")
-        frame.rowconfigure(9, weight=1)
+        for widget in (self.url, self.message):
+            add_clipboard_menu(widget)
+        root.bind_all("<Control-KeyPress>", _on_ctrl_key, add="+")
 
-        for widget in (self.token, self.url, self.message):
-            self._add_context_menu(widget)
-        root.bind_all("<Control-KeyPress>", self._on_ctrl_key, add="+")
-        self.url.focus_set()
+        self.refresh_accounts()
         root.after(100, self._poll)
 
-    # --- удобство ввода ---------------------------------------------------------
+    # --- список аккаунтов и выбор -------------------------------------------------
 
-    def _add_context_menu(self, widget: "tk.Widget") -> None:
-        menu = tk.Menu(widget, tearoff=False)
-        for label, event in (("Вырезать", "<<Cut>>"), ("Копировать", "<<Copy>>"), ("Вставить", "<<Paste>>"),
-                             ("Выделить всё", "<<SelectAll>>")):
-            menu.add_command(label=label, command=lambda e=event: widget.event_generate(e))
-        widget.bind("<Button-3>", lambda ev: menu.tk_popup(ev.x_root, ev.y_root))
+    def refresh_accounts(self) -> None:
+        accounts = self.store.accounts()
+        children = self.tree.get_children()
+        if children:
+            self.tree.delete(*children)
+        for a in accounts:
+            site = normalize_site(a.base_url).replace("https://", "").replace("http://", "")
+            self.tree.insert("", "end", iid=f"acc:{a.name}", values=(a.name, a.login or "—", site, STATUS_TEXT[a.status]))
 
-    @staticmethod
-    def _on_ctrl_key(event: "tk.Event") -> str | None:
-        if event.keysym.lower() in ("v", "c", "x", "a"):
-            return None  # латинская раскладка — Tk справится сам
-        for virtual, codes in _CTRL_KEYCODES.items():
-            if event.keycode in codes:
-                event.widget.event_generate(virtual)
-                return "break"
-        return None
+        for widget in self.picker.winfo_children():
+            widget.destroy()
+        if not accounts:
+            self.account_var.set("")
+            ttk.Label(self.picker, text="Аккаунтов пока нет. Нажмите «Добавить аккаунт».", foreground="gray").pack(
+                anchor="w"
+            )
+            return
+        if self.account_var.get() not in {a.name for a in accounts}:
+            self.account_var.set(accounts[0].name)
+        for a in accounts:
+            hint = "" if a.status == OK else f"  — {STATUS_TEXT[a.status]}"
+            ttk.Radiobutton(
+                self.picker, text=f"{a.name}  ({a.login or '—'}){hint}", value=a.name, variable=self.account_var
+            ).pack(anchor="w", pady=1)
 
-    # --- журнал и состояние -----------------------------------------------------
+    def _selected_name(self) -> str | None:
+        selected = self.tree.selection()
+        return selected[0][len("acc:"):] if selected else None
+
+    # --- связь с фоновыми потоками ------------------------------------------------
+
+    def _post(self, fn) -> None:
+        """Выполнить fn в окне (вызывается из фонового потока)."""
+        self.events.put(("call", fn))
+
+    def _ask(self, fn):
+        """Выполнить fn в окне и дождаться результата (вызывается из фонового потока)."""
+        box: dict = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                box["value"] = fn()
+            finally:
+                done.set()
+
+        self.events.put(("call", run))
+        done.wait()
+        return box.get("value")
+
+    def _run_bg(self, fn, *args) -> bool:
+        """Запускает долгую операцию в фоне. Одновременно идёт только одна."""
+        if self.busy:
+            messagebox.showinfo(TITLE, "Дождитесь окончания текущей операции.", parent=self.root)
+            return False
+        self._set_busy(True)
+
+        def runner() -> None:
+            try:
+                fn(*args)
+            except VintedError as e:
+                self.events.put(("error", str(e)))
+            except Exception as e:  # ошибки браузера и прочее
+                self.events.put(("error", playwright_error_text(e)))
+            finally:
+                self._post(self.refresh_accounts)
+                self.events.put(("idle", None))
+
+        threading.Thread(target=runner, daemon=True).start()
+        return True
+
+    def _poll(self) -> None:
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "log":
+                    self._write(payload)
+                elif kind == "ok":
+                    self._write(payload, "ok")
+                elif kind == "error":
+                    self._write(f"Ошибка: {payload}", "error")
+                    messagebox.showerror(TITLE, payload, parent=self.root)
+                elif kind == "call":
+                    try:
+                        payload()
+                    except Exception as e:  # одна ошибка не должна останавливать окно
+                        self._write(f"Ошибка окна: {e}", "error")
+                elif kind == "idle":
+                    self._set_busy(False)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll)
+
+    def _set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        self.send_button.configure(state="disabled" if busy else "normal")
 
     def _write(self, text: str, tag: str | None = None) -> None:
         self.log.configure(state="normal")
@@ -107,99 +258,188 @@ class App:
         self.log.see("end")
         self.log.configure(state="disabled")
 
-    def _set_busy(self, busy: bool) -> None:
-        self.busy = busy
-        self.send_button.configure(state="disabled" if busy else "normal", text="Подождите..." if busy else "Отправить")
+    def _clear_log(self) -> None:
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
 
-    def _emit(self, kind: str, payload: object = None) -> None:
-        self.events.put((kind, payload))
+    # --- аккаунты: добавить, войти, проверить, удалить ---------------------------
 
-    def _poll(self) -> None:
+    def on_add(self) -> None:
+        self._account_dialog(None)
+
+    def on_login(self) -> None:
+        name = self._selected_name()
+        if name is None:
+            messagebox.showinfo(TITLE, "Сначала выберите аккаунт в списке.", parent=self.root)
+            return
+        self._account_dialog(name)
+
+    def on_check(self) -> None:
+        accounts = self.store.accounts()
+        if not accounts:
+            messagebox.showinfo(TITLE, "Аккаунтов пока нет.", parent=self.root)
+            return
+        self._clear_log()
+
+        def work() -> None:
+            for a in accounts:
+                try:
+                    acc = check_account(self.store, a.name, headless=True)
+                    extra = f" ({acc.login})" if acc.login else ""
+                    self.events.put(("log", f"{acc.name}: {STATUS_TEXT[acc.status]}{extra}"))
+                except VintedError as e:
+                    self.events.put(("log", f"{a.name}: проверка не удалась — {e}"))
+
+        self._run_bg(work)
+
+    def on_remove(self) -> None:
+        name = self._selected_name()
+        if name is None:
+            messagebox.showinfo(TITLE, "Сначала выберите аккаунт в списке.", parent=self.root)
+            return
+        if self.busy:
+            messagebox.showinfo(TITLE, "Дождитесь окончания текущей операции.", parent=self.root)
+            return
+        if not messagebox.askyesno(
+            TITLE,
+            f"Удалить аккаунт «{name}» из приложения?\nСохранённый вход на этом компьютере тоже будет стёрт.",
+            parent=self.root,
+        ):
+            return
         try:
-            while True:
-                kind, payload = self.events.get_nowait()
-                if kind == "log":
-                    self._write(str(payload))
-                elif kind == "ok":
-                    self._write(str(payload), "ok")
-                elif kind == "error":
-                    self._write(f"Ошибка: {payload}", "error")
-                    messagebox.showerror(TITLE, str(payload), parent=self.root)
-                elif kind == "token_used":
-                    self.token.delete(0, "end")
-                    self.token_hint.configure(text="Вход сохранён — токен больше не нужен.")
-                elif kind == "confirm":
-                    listing, text, answer, done = payload
-                    answer["ok"] = messagebox.askyesno(
-                        "Отправить сообщение?",
-                        f"Продавец: {listing.seller_login or '?'} (id {listing.seller_id})\n"
-                        f"Объявление: {listing.title}\n\nСообщение:\n{text}",
-                        parent=self.root,
-                    )
-                    done.set()
-                elif kind == "idle":
-                    self._set_busy(False)
-        except queue.Empty:
-            pass
-        self.root.after(100, self._poll)
+            self.store.remove(name)
+        except VintedError as e:
+            messagebox.showerror(TITLE, str(e), parent=self.root)
+        self.refresh_accounts()
 
-    # --- отправка ---------------------------------------------------------------
+    def _account_dialog(self, name: str | None) -> None:
+        """Окно добавления аккаунта (name=None) или нового входа в существующий."""
+        adding = name is None
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Новый аккаунт" if adding else f"Вход в «{name}»")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        form = ttk.Frame(dlg, padding=16)
+        form.pack(fill="both", expand=True)
+
+        name_entry = site_entry = None
+        if adding:
+            ttk.Label(form, text="Имя аккаунта в приложении (например, «Я» или «Аня»)").pack(anchor="w")
+            name_entry = ttk.Entry(form, width=52)
+            name_entry.pack(anchor="w", fill="x", pady=(2, 10))
+            ttk.Label(form, text="Сайт Vinted этого аккаунта").pack(anchor="w")
+            site_entry = ttk.Entry(form, width=52)
+            site_entry.insert(0, DEFAULT_SITE)
+            site_entry.pack(anchor="w", fill="x", pady=(2, 10))
+        else:
+            ttk.Label(form, text=f"Аккаунт: {name}").pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(form, text="Refresh-токен (cookie refresh_token_web)").pack(anchor="w")
+        token_entry = ttk.Entry(form, width=52, show="•")
+        token_entry.pack(anchor="w", fill="x", pady=(2, 10))
+
+        consent = tk.BooleanVar(value=not adding)
+        hint = ttk.Label(form, text="", foreground=RED, wraplength=460)
+        if adding:
+            ttk.Checkbutton(
+                form, text="Аккаунт мой или владелец дал согласие на его использование", variable=consent
+            ).pack(anchor="w")
+            ttk.Label(
+                form,
+                text="Передача доступа к аккаунту нарушает правила Vinted. "
+                "Ответственность за аккаунт несёт тот, кто им пользуется.",
+                foreground=RED,
+                wraplength=460,
+            ).pack(anchor="w", pady=(4, 0))
+        hint.pack(anchor="w", pady=(6, 0))
+
+        def submit(_event=None) -> None:
+            token = token_entry.get().strip()
+            if adding:
+                new_name = name_entry.get().strip()
+                site = site_entry.get().strip()
+                if not new_name:
+                    hint.configure(text="Введите имя аккаунта.")
+                    return
+                if not consent.get():
+                    hint.configure(text="Отметьте галочку согласия.")
+                    return
+            if not token:
+                hint.configure(text="Вставьте refresh-токен.")
+                return
+            hint.configure(text="")
+
+            def finish(text: str) -> None:
+                self.refresh_accounts()
+                dlg.destroy()
+                messagebox.showinfo(TITLE, text, parent=self.root)
+
+            def work() -> None:
+                if adding:
+                    acc = add_account(self.store, new_name, site, token, consent=True, headless=True)
+                    text = f"Аккаунт «{acc.name}» добавлен: {acc.login} (id {acc.user_id})."
+                else:
+                    acc = login_account(self.store, name, token, headless=True)
+                    text = f"Вход в «{acc.name}» выполнен: {acc.login}."
+                self._post(lambda: finish(text))
+
+            self._run_bg(work)
+
+        buttons = ttk.Frame(form)
+        buttons.pack(anchor="e", pady=(10, 0))
+        ttk.Button(buttons, text="Отмена", command=dlg.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text="Войти и сохранить" if adding else "Войти", command=submit).pack(side="right")
+        token_entry.bind("<Return>", submit)
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        add_clipboard_menu(token_entry)
+        if adding:
+            add_clipboard_menu(name_entry)
+            add_clipboard_menu(site_entry)
+            name_entry.focus_set()
+        else:
+            token_entry.focus_set()
+        _grab_later(dlg)
+
+    # --- отправка -----------------------------------------------------------------
 
     def on_send(self) -> None:
-        if self.busy:
-            return
-        token = self.token.get().strip()
+        name = self.account_var.get()
         url = self.url.get().strip()
         text = self.message.get("1.0", "end").strip()
+        if not name:
+            messagebox.showwarning(TITLE, "Добавьте аккаунт и выберите его для отправки.", parent=self.root)
+            return
         if not url:
             messagebox.showwarning(TITLE, "Вставьте ссылку на объявление.", parent=self.root)
             return
         if not text:
             messagebox.showwarning(TITLE, "Введите текст сообщения.", parent=self.root)
             return
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
-        self._set_busy(True)
-        threading.Thread(target=self._work, args=(token, url, text), daemon=True).start()
+        self._clear_log()
 
-    def _confirm(self, listing: Listing, text: str) -> bool:
-        answer: dict = {}
-        done = threading.Event()
-        self._emit("confirm", (listing, text, answer, done))
-        done.wait()
-        return bool(answer.get("ok"))
+        def work() -> None:
+            def log(line: str) -> None:
+                self.events.put(("log", line))
 
-    def _work(self, token: str, url: str, text: str) -> None:
-        """Выполняется в фоновом потоке: вся работа с браузером — здесь."""
-        try:
-            base_url, item_id = parse_listing_url(url)
-            settings = Settings.from_env()
-            settings = dataclasses.replace(settings, base_url=(os.environ.get("VINTED_BASE_URL") or base_url).rstrip("/"))
-            self._emit("log", f"Открываю {settings.base_url} ...")
-            with VintedSession(settings) as vs:
-                user = vs.ensure_login(token or None)
-                if token:
-                    self._emit("token_used")
-                self._emit("log", f"Вы вошли как {user.get('login', '?')} (id {user.get('id', '?')}).")
-                listing = get_listing(vs, item_id)
-                self._emit("log", f"Объявление: {listing.title}")
-                self._emit("log", f"Продавец: {listing.seller_login or '?'} (id {listing.seller_id})")
-                if not self._confirm(listing, text):
-                    self._emit("log", "Отменено — ничего не отправлено.")
-                    return
-                self._emit("log", "Отправляю...")
-                result = send_message_to_listing(vs, listing, text)
-                if result.verified:
-                    self._emit("ok", f"✓ Сообщение отправлено продавцу {listing.seller_login or listing.seller_id}.")
-                else:
-                    self._emit("log", "Сообщение отправлено, но найти его в чате для проверки не удалось.")
-        except VintedError as e:
-            self._emit("error", str(e))
-        except Exception as e:  # ошибки браузера (Playwright) и прочее
-            self._emit("error", playwright_error_text(e))
-        finally:
-            self._emit("idle")
+            def confirm(listing, account) -> bool:
+                question = (
+                    f"С аккаунта: {account.name} ({account.login or '—'})\n"
+                    f"Продавец: {listing.seller_login or '?'} (id {listing.seller_id})\n"
+                    f"Объявление: {listing.title}\n\nСообщение:\n{text}"
+                )
+                return bool(self._ask(lambda: messagebox.askyesno("Отправить сообщение?", question, parent=self.root)))
+
+            result = send_from_account(self.store, name, url, text, confirm=confirm, log=log, headless=True)
+            if result is None:
+                return
+            seller = result.listing.seller_login or result.listing.seller_id
+            if result.verified:
+                self.events.put(("ok", f"✓ Сообщение отправлено с аккаунта «{name}» продавцу {seller}."))
+            else:
+                self.events.put(("log", "Сообщение отправлено, но подтвердить его в чате не удалось."))
+
+        self._run_bg(work)
 
 
 def main() -> int:
@@ -208,7 +448,7 @@ def main() -> int:
             "Для окна приложения нужен Tkinter.\n"
             "  Linux:   sudo apt install python3-tk\n"
             "  Windows/macOS: он входит в стандартный установщик Python с python.org.\n"
-            "Пока его нет, используйте терминал: python -m vinted_app send <ссылка> <сообщение>",
+            "Пока его нет, используйте терминал: python -m vinted_app send <ссылка> <сообщение> --account <имя>",
             file=sys.stderr,
         )
         return 2
@@ -216,7 +456,3 @@ def main() -> int:
     App(root)
     root.mainloop()
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

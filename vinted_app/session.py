@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -265,11 +266,16 @@ class VintedSession:
         backup = [c for c in ctx.cookies() if c["name"] in (ACCESS_COOKIE, REFRESH_COOKIE)]
         ctx.clear_cookies(name=ACCESS_COOKIE)
         ctx.clear_cookies(name=REFRESH_COOKIE)
-        host = urlparse(self.settings.base_url).hostname
-        ctx.add_cookies([{
-            "name": REFRESH_COOKIE, "value": token, "domain": f".{host}", "path": "/",
-            "secure": True, "httpOnly": True, "sameSite": "Lax",
-        }])
+        host = urlparse(self.settings.base_url).hostname or ""
+        # Для сайтов Vinted cookie ставится на «.домен»; для IP и localhost — без точки.
+        domain = host if host == "localhost" or re.fullmatch(r"[\d.]+", host) else f".{host}"
+        cookie = {
+            "name": REFRESH_COOKIE, "value": token, "domain": domain, "path": "/",
+            "secure": self.settings.base_url.startswith("https://"), "httpOnly": True, "sameSite": "Lax",
+        }
+        if "exp" in payload:  # со сроком, иначе браузер не сохранит cookie на диск после закрытия
+            cookie["expires"] = payload["exp"]
+        ctx.add_cookies([cookie])
         try:
             self.refresh_tokens()
         except NotLoggedInError:
