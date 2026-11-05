@@ -19,7 +19,7 @@ except ImportError:  # на Linux Tkinter ставится отдельно
 
 from .config import Settings
 from .monitor import Item, normalize_search_url, watch
-from .session import VintedError, playwright_error_text
+from .session import VintedError
 
 MAX_CARDS = 200   # сколько карточек держать на экране
 PHOTO_SIZE = 180  # сторона фото в пикселях
@@ -45,6 +45,22 @@ def _photo_image(data: bytes | None, master):
         return ImageTk.PhotoImage(img, master=master)
     except Exception:  # битая картинка не должна ломать окно
         return None
+
+
+BROWSER_HINT = (
+    "Ошибка: не установлен браузер для проверок. В Терминале в папке проекта выполните "
+    "python -m playwright install chromium и запустите окно заново."
+)
+
+
+def _friendly_error(exc: Exception) -> str:
+    """Понятный текст вместо технической ошибки. Самая частая причина — не установлен браузер Playwright."""
+    text = str(exc)
+    low = text.lower()
+    if "executable doesn't exist" in low or "playwright install" in low:
+        return BROWSER_HINT
+    first_line = text.splitlines()[0] if text else type(exc).__name__
+    return f"Ошибка: {first_line}"
 
 
 class MonitorWindow:
@@ -149,10 +165,16 @@ class MonitorWindow:
         except ValueError:
             self._status("Введите число минут, например 5.")
             return
-        note = "" if _pillow_available() else " Фото не покажутся: установите pillow (pip install pillow)."
+        notes = []
+        if minutes < 2:
+            minutes = 2
+            self.minutes_var.set("2")
+            notes.append("Чаще двух минут не проверяю: от частых запросов Vinted блокирует.")
+        if not _pillow_available():
+            notes.append("Фото не покажутся: установите pillow (pip install pillow).")
         self.stop_event = threading.Event()
         self._set_running(True)
-        self._status("Запускаю монитор..." + note)
+        self._status(" ".join(["Запускаю монитор..."] + notes))
         threading.Thread(target=self._worker, args=(url, minutes * 60, self.stop_event), daemon=True).start()
 
     def stop(self) -> None:
@@ -179,7 +201,7 @@ class MonitorWindow:
         except VintedError as e:
             self.events.put(("status", f"Ошибка: {e}"))
         except Exception as e:  # ошибки браузера и прочее
-            self.events.put(("status", f"Ошибка браузера: {playwright_error_text(e)}"))
+            self.events.put(("status", _friendly_error(e)))
         finally:
             self.events.put(("idle", None))
 
