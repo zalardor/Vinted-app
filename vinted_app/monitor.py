@@ -146,6 +146,33 @@ def _fetch_image(vs: VintedSession, image_url: str) -> bytes | None:
     return resp.body() if resp.status == 200 else None
 
 
+def _with_fresh_time(url: str) -> str:
+    """Ставит в ссылку текущее время, как при новом поиске. Остальные фильтры не меняются."""
+    parsed = urlparse(url)
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+    if not any(key == "time" for key, _ in params):
+        return url
+    params = [(key, str(int(time.time())) if key == "time" else value) for key, value in params]
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", urlencode(params), ""))
+
+
+def _load_item(vs: VintedSession, base: str, item_id: str, fetch_images: bool):
+    """Карточка объявления: ('ok', объявление, фото), ('gone', None, None) или ('blocked', None, None)."""
+    resp = vs.context.request.get(f"{base}/items/{item_id}", headers={"accept": "text/html"})
+    body = resp.text()
+    if resp.status in (403, 429) or ("captcha-delivery" in body and "og:title" not in body):
+        return "blocked", None, None
+    if resp.status != 200:
+        return "gone", None, None  # объявление удалили
+    item = parse_item(body, item_id, base)
+    image = _fetch_image(vs, item.image_url) if fetch_images and item.image_url else None
+    return "ok", item, image
+
+
+def _passes_price(item: Item, max_price: float | None) -> bool:
+    return max_price is None or item.price is None or item.price <= max_price
+
+
 def _check(
     vs: VintedSession,
     url: str,
@@ -155,17 +182,26 @@ def _check(
     stop: threading.Event,
     pause: Callable[[float], object],
 ) -> tuple[list[tuple[Item, bytes | None]], str | None]:
-    """Одна проверка. Возвращает (новые объявления с фото, причина остановки или None)."""
+    """Одна проверка. Возвращает (объявления для показа с фото, причина остановки или None)."""
     base = _origin(url)
-    vs.page.goto(url, wait_until="domcontentloaded")
+    vs.page.goto(_with_fresh_time(url), wait_until="domcontentloaded")
     vs.page.wait_for_timeout(5000)
     if _challenge_title(vs.page.title()):
         return [], "Vinted показал проверку «подождите»."
     ids = parse_item_ids(vs.page.content())
 
     if not state.baseline:
-        state.remember(ids)  # первая проверка только запоминает текущие объявления
+        # Первая проверка: показываем последнее выставленное объявление, остальные только запоминаем.
+        if not ids:
+            state.baseline = True
+            return [], None
+        status, item, image = _load_item(vs, base, ids[0], fetch_images)
+        if status == "blocked":
+            return [], "Карточка объявления закрыта проверкой."
+        state.remember(ids)
         state.baseline = True
+        if status == "ok" and _passes_price(item, max_price):
+            return [(item, image)], None
         return [], None
 
     fresh = [i for i in ids if i not in state.seen][:MAX_NEW_PER_CYCLE]
@@ -175,18 +211,12 @@ def _check(
             break
         if n:
             pause(ITEM_PAUSE)
-        resp = vs.context.request.get(f"{base}/items/{item_id}", headers={"accept": "text/html"})
-        body = resp.text()
-        if resp.status in (403, 429) or ("captcha-delivery" in body and "og:title" not in body):
+        status, item, image = _load_item(vs, base, item_id, fetch_images)
+        if status == "blocked":
             return found, "Карточка объявления закрыта проверкой."
         state.remember([item_id])  # отмечаем, даже если отфильтруем — чтобы не открывать второй раз
-        if resp.status != 200:
-            continue
-        item = parse_item(body, item_id, base)
-        if max_price is not None and item.price is not None and item.price > max_price:
-            continue
-        image = _fetch_image(vs, item.image_url) if fetch_images and item.image_url else None
-        found.append((item, image))
+        if status == "ok" and _passes_price(item, max_price):
+            found.append((item, image))
     return found, None
 
 
@@ -231,7 +261,7 @@ def watch(
 
     on_status("Слежу за поиском. Новые объявления появятся ниже.")
     if not state.baseline:
-        on_status("Первая проверка запомнит текущие объявления. Новые будут приходить позже.")
+        on_status("Первая проверка покажет последнее объявление из ссылки. Дальше — только новые.")
 
     session_settings = dataclasses.replace(settings, base_url=base, profile_dir=state_dir / "profile")
     with VintedSession(session_settings, headless=headless) as vs:
