@@ -63,6 +63,27 @@ def _friendly_error(exc: Exception) -> str:
     return f"Ошибка: {first_line}"
 
 
+def _entry_menu(entry) -> None:
+    """Меню по правой кнопке (и по Ctrl+клику на Mac): вставить, копировать, вырезать, выделить всё."""
+    menu = tk.Menu(entry, tearoff=False)
+    for label, event in (
+        ("Вставить", "<<Paste>>"),
+        ("Копировать", "<<Copy>>"),
+        ("Вырезать", "<<Cut>>"),
+        ("Выделить всё", "<<SelectAll>>"),
+    ):
+        menu.add_command(label=label, command=lambda e=event: entry.event_generate(e))
+
+    def popup(event) -> None:
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    for sequence in ("<Button-2>", "<Button-3>", "<Control-Button-1>"):
+        entry.bind(sequence, popup)
+
+
 class MonitorWindow:
     def __init__(self, master) -> None:
         self.top = tk.Toplevel(master)
@@ -83,6 +104,11 @@ class MonitorWindow:
         self.url_var = tk.StringVar()
         self.url_entry = ttk.Entry(bar, textvariable=self.url_var)
         self.url_entry.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(2, 8))
+        self.paste_button = ttk.Button(bar, text="Вставить", command=self.paste_link)
+        self.paste_button.grid(row=1, column=4, sticky="e", padx=(6, 0), pady=(2, 8))
+        _entry_menu(self.url_entry)
+        self.running_url: str | None = None
+        self.url_var.trace_add("write", self._on_url_edit)
         ttk.Label(bar, text="Проверять каждые, мин").grid(row=2, column=0, sticky="w")
         self.minutes_var = tk.StringVar(value="5")
         ttk.Spinbox(bar, from_=2, to=60, width=5, textvariable=self.minutes_var).grid(row=2, column=1, sticky="w")
@@ -145,11 +171,25 @@ class MonitorWindow:
     def _status(self, text: str) -> None:
         self.status.configure(text=text)
 
+    def paste_link(self) -> None:
+        """Вставляет ссылку из буфера обмена кнопкой «Вставить»: работает, даже если Cmd+V не срабатывает."""
+        try:
+            text = self.top.clipboard_get()
+        except tk.TclError:
+            self._status("В буфере обмена нет текста. Скопируйте ссылку поиска и нажмите «Вставить».")
+            return
+        self.url_var.set(text.strip())
+        self.url_entry.icursor("end")
+        self.url_entry.focus_set()
+
+    def _on_url_edit(self, *_args) -> None:
+        if self.running and self.url_var.get() != self.running_url:
+            self._status("Ссылка изменилась. Чтобы следить за новой, нажмите «Стоп», затем «Старт».")
+
     def _set_running(self, on: bool) -> None:
         self.running = on
         self.start_button.configure(state="disabled" if on else "normal")
         self.stop_button.configure(state="normal" if on else "disabled")
-        self.url_entry.configure(state="disabled" if on else "normal")
 
     # --- слежение --------------------------------------------------------------------
 
@@ -173,6 +213,7 @@ class MonitorWindow:
         if not _pillow_available():
             notes.append("Фото не покажутся: установите pillow (pip install pillow).")
         self.stop_event = threading.Event()
+        self.running_url = self.url_var.get()
         self._set_running(True)
         self._status(" ".join(["Запускаю монитор..."] + notes))
         threading.Thread(target=self._worker, args=(url, minutes * 60, self.stop_event), daemon=True).start()
