@@ -165,6 +165,19 @@ def cmd_accounts(settings: Settings, args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_monitor(settings: Settings, args: argparse.Namespace) -> int:
+    from .monitor import run_monitor
+
+    return run_monitor(
+        settings,
+        args.query,
+        max_price=args.max_price,
+        interval=args.interval,
+        once=args.once,
+        headless=not args.headed,
+    )
+
+
 def cmd_gui(settings: Settings, args: argparse.Namespace) -> int:
     from .gui import main as gui_main
 
@@ -228,6 +241,14 @@ def main(argv: list[str] | None = None) -> int:
     p_rm = acc_sub.add_parser("remove", help="удалить аккаунт и его сохранённый вход")
     p_rm.add_argument("name", help="имя аккаунта")
     p_acc.set_defaults(func=cmd_accounts)
+
+    p_mon = sub.add_parser("monitor", help="уведомлять о новых объявлениях по поиску (не покупает и не пишет)")
+    p_mon.add_argument("query", help="что искать, например «kurtka zara»")
+    p_mon.add_argument("--max-price", type=float, help="только объявления не дороже этой цены (в валюте сайта)")
+    p_mon.add_argument("--interval", type=int, default=300, help="пауза между проверками, секунд (не меньше 120)")
+    p_mon.add_argument("--once", action="store_true", help="проверить один раз и выйти")
+    p_mon.add_argument("--headed", action="store_true", help="показать окно браузера")
+    p_mon.set_defaults(func=cmd_monitor)
 
     p_gui = sub.add_parser("gui", help="открыть окно приложения")
     p_gui.set_defaults(func=cmd_gui)
