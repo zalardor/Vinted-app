@@ -82,6 +82,7 @@ class App:
         self.store = store or service.default_store()
         self.events: queue.Queue = queue.Queue()
         self.busy = False
+        self.monitor_window = None
         self.account_var = tk.StringVar(value="")
 
         root.title(TITLE)
@@ -117,6 +118,7 @@ class App:
             ("Ввести токен", self.on_login),
             ("Проверить все", self.on_check),
             ("Удалить", self.on_remove),
+            ("Монитор объявлений", self.on_monitor),
         ):
             ttk.Button(buttons, text=text, command=command).pack(side="left", padx=(0, 6))
 
@@ -292,6 +294,15 @@ class App:
                     self.events.put(("log", f"{a.name}: проверка не удалась — {e}"))
 
         self._run_bg(work)
+
+    def on_monitor(self) -> None:
+        """Открывает окно монитора или выводит уже открытое наверх."""
+        from .monitor_gui import MonitorWindow
+
+        if self.monitor_window is None or not self.monitor_window.exists():
+            self.monitor_window = MonitorWindow(self.root)
+        else:
+            self.monitor_window.raise_window()
 
     def on_remove(self) -> None:
         name = self._selected_name()
